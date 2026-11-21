@@ -107,6 +107,12 @@ llama-cpp-sys-2 = { version = "=0.1.146", default-features = false }
 
 [patch.crates-io]
 cudaforge = { git = "https://github.com/jbg/cudaforge", rev = "e7c1967340e40673db98dc9e17da0f04834a456f" }
+# Vendored to replace the removed legacy index() call in c/linux.c, which current
+# Android NDK clang rejects.
+sys-info = { path = "third_party/sys-info" }
+# Vendored so Android/Termux verifies TLS with WebPKI + bundled roots instead of
+# the JVM-backed platform verifier, which panics without a JavaVM.
+rustls-platform-verifier = { path = "third_party/rustls-platform-verifier" }
 
 # Dependencies don't need debug info. You rarely step-debug into third-party
 # crates, but their DWARF dominates `target/debug` — roughly 50-70% of each

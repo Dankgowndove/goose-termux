@@ -351,10 +351,7 @@ fn announce_user_action(device: &DeviceCodeResponse) {
         return;
     }
 
-    let copied = arboard::Clipboard::new()
-        .ok()
-        .and_then(|mut cb| cb.set_text(&device.user_code).ok())
-        .is_some();
+    let copied = crate::clipboard::copy(&device.user_code);
     if let Err(e) = webbrowser::open(&verify_url) {
         tracing::warn!("Failed to open browser: {}", e);
     }
