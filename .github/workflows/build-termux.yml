@@ -1,0 +1,231 @@
+name: Build Termux binaries
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Publish the built binaries as a GitHub Release'
+        required: false
+        default: true
+        type: boolean
+      tag:
+        description: 'Release tag (default: termux-v<cargo version>)'
+        required: false
+        default: ''
+        type: string
+  push:
+    tags:
+      - 'termux-v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: termux-build-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: 10
+  RUST_BACKTRACE: 1
+  ANDROID_API: '24'
+
+jobs:
+  android_aarch64:
+    name: Android aarch64 (Termux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/share/swift
+          df -h /
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config clang libclang-dev perl
+
+      - name: Install Rust toolchain
+        run: |
+          channel="$(grep '^channel' rust-toolchain.toml | cut -d'"' -f2)"
+          rustup toolchain install "$channel" --profile minimal
+          rustup target add --toolchain "$channel" aarch64-linux-android
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          key: android-aarch64
+
+      - name: Export NDK cross-compilation settings
+        run: |
+          ndk="${ANDROID_NDK_ROOT:-${ANDROID_NDK_HOME:?Android NDK not found on runner}}"
+          bin="$ndk/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          cc="$bin/aarch64-linux-android${ANDROID_API}-clang"
+          test -x "$cc" || { echo "::error::missing NDK compiler $cc"; exit 1; }
+          {
+            echo "TARGET=aarch64-linux-android"
+            echo "NDK=$ndk"
+            echo "ANDROID_NDK_ROOT=$ndk"
+            echo "ANDROID_NDK_HOME=$ndk"
+            echo "ANDROID_NDK=$ndk"
+            echo "CC_aarch64_linux_android=$cc"
+            echo "CXX_aarch64_linux_android=$bin/aarch64-linux-android${ANDROID_API}-clang++"
+            echo "AR_aarch64_linux_android=$bin/llvm-ar"
+            echo "RANLIB_aarch64_linux_android=$bin/llvm-ranlib"
+            echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$cc"
+            echo "RUSTFLAGS=-C link-arg=-Wl,-z,max-page-size=16384"
+          } >> "$GITHUB_ENV"
+
+      - name: Check compilation
+        run: |
+          cargo check --target "$TARGET" -p goose-cli --bin goose \
+            --no-default-features --features portable-default
+
+      - name: Build release binary
+        run: |
+          cargo build --release --target "$TARGET" -p goose-cli --bin goose \
+            --no-default-features --features portable-default
+
+      - name: Verify and package binary
+        run: |
+          bin="target/$TARGET/release/goose"
+          binutils="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          file "$bin"
+
+          # Android's dynamic linker only ships the bionic libs below. Anything
+          # else would be unresolvable at runtime for a Termux user.
+          needed="$("$binutils/llvm-readelf" -d "$bin" | sed -n 's/.*NEEDED.*\[\(.*\)\]/\1/p')"
+          echo "Shared libraries: ${needed:-<none>}"
+          if printf '%s\n' "$needed" | grep -qx 'libc++_shared\.so'; then
+            echo "::warning::binary needs libc++_shared.so; Termux ships it in \$PREFIX/lib"
+          fi
+          unexpected="$(printf '%s\n' "$needed" | grep -v -E '^(libc|libdl|libm|liblog|libandroid)\.so$' | grep -v -x 'libc\+\+_shared\.so' | grep -v '^$' || true)"
+          if [ -n "$unexpected" ]; then
+            echo "::error::binary depends on non-system libraries: $unexpected"
+            exit 1
+          fi
+
+          # Bionic rejects ARM64 executables whose TLS segment is not 64-byte aligned.
+          tls_align="$("$binutils/llvm-readelf" -l "$bin" | awk '/^  TLS/{print $NF}' | head -n1)"
+          echo "TLS alignment: ${tls_align:-unknown}"
+          if [ "$tls_align" != "0x40" ] && [ "$tls_align" != "0x4000" ]; then
+            echo "::error::unexpected TLS alignment $tls_align (bionic needs 0x40)"
+            exit 1
+          fi
+
+          # 16 KiB page size support (required by Android 15+ devices and emulators).
+          "$binutils/llvm-readelf" -l "$bin" | awk '$1 == "LOAD" { print "LOAD alignment: " $NF }'
+
+          "$binutils/llvm-strip" --strip-all "$bin"
+          ls -lh "$bin"
+
+          mkdir -p package
+          cp "$bin" package/goose
+          tar -czf goose-aarch64-linux-android.tar.gz -C package goose
+          sha256sum goose-aarch64-linux-android.tar.gz
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: goose-aarch64-linux-android
+          path: goose-aarch64-linux-android.tar.gz
+          if-no-files-found: error
+
+  musl_aarch64:
+    name: Static musl aarch64 (Termux fallback)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 240
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential musl-tools pkg-config cmake perl clang libclang-dev
+
+      - name: Install Rust toolchain
+        run: |
+          channel="$(grep '^channel' rust-toolchain.toml | cut -d'"' -f2)"
+          rustup toolchain install "$channel" --profile minimal
+          rustup target add --toolchain "$channel" aarch64-unknown-linux-musl
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          key: musl-aarch64
+
+      - name: Build static release binary
+        run: |
+          cargo build --release --target aarch64-unknown-linux-musl -p goose-cli --bin goose \
+            --no-default-features --features portable-default
+
+      - name: Smoke test and package binary
+        run: |
+          bin="target/aarch64-unknown-linux-musl/release/goose"
+          file "$bin"
+          "$bin" --version
+          mkdir -p package
+          cp "$bin" package/goose
+          tar -czf goose-aarch64-unknown-linux-musl.tar.gz -C package goose
+          sha256sum goose-aarch64-unknown-linux-musl.tar.gz
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: goose-aarch64-unknown-linux-musl
+          path: goose-aarch64-unknown-linux-musl.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    needs: [android_aarch64, musl_aarch64]
+    if: ${{ always() && (needs.android_aarch64.result == 'success' || needs.musl_aarch64.result == 'success') && (github.event_name == 'push' || inputs.publish) }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Download artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Assemble release assets
+        id: assets
+        run: |
+          cp termux/install.sh dist/install.sh
+          ( cd dist && sha256sum *.tar.gz > SHA256SUMS )
+          ls -lh dist
+
+          if [ -n "${{ inputs.tag }}" ]; then
+            tag="${{ inputs.tag }}"
+          elif [[ "$GITHUB_REF_NAME" == termux-v* ]]; then
+            tag="$GITHUB_REF_NAME"
+          else
+            version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)"
+            tag="termux-v$version"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Releasing $tag"
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ steps.assets.outputs.tag }}"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$tag" dist/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "goose for Termux $tag" \
+              --notes-file termux/RELEASE_NOTES.md
+          fi

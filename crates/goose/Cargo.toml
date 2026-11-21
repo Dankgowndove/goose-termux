@@ -118,7 +118,6 @@ rmcp = { workspace = true, features = [
     "transport-streamable-http-client-unix-socket",
 ] }
 oauth2 = { version = "5.0", default-features = false }
-arboard = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 futures = { workspace = true }
@@ -261,6 +260,10 @@ keyring = { workspace = true, features = ["apple-native"], optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { workspace = true, features = ["sync-secret-service"], optional = true }
+
+# arboard has no Android backend; Termux clipboard access lives in `src/clipboard.rs`.
+[target.'cfg(not(target_os = "android"))'.dependencies]
+arboard = { workspace = true }
 
 [target."cfg(unix)".dependencies]
 libc = { version = "0.2.182", default-features = false, features = ["std"] }
